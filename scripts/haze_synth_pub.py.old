@@ -1,0 +1,516 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
+BASE = os.path.expanduser("~/atmos/BA/Plots")
+
+SPECIES_FILE = os.path.join(BASE, "species_analysis_pub", "tables", "species_metrics.csv")
+AEROSOL_FILE = os.path.join(BASE, "aerosol_analysis_pub", "tables", "aerosol_metrics.csv")
+OUT_DIR = os.path.join(BASE, "haze_synthesis_pub")
+
+RUN_ORDER = ["Run_1", "Run_2", "Run_3"]
+RUN_LABELS = {
+    "Run_1": "2.7 Gy star",
+    "Run_2": "0.5 Gy star",
+    "Run_3": "9.9 Gy star",
+}
+
+SCENARIO_TO_FSCALE = {
+    1: 0.75,
+    2: 1.00,
+    3: 1.50,
+    "1": 0.75,
+    "2": 1.00,
+    "3": 1.50,
+}
+
+STAR_ORDER = ["Epsilon_Eri", "HD40307", "HD85512", "HD97658"]
+STAR_COLORS = {
+    "Epsilon_Eri": "tab:blue",
+    "HD40307": "tab:orange",
+    "HD85512": "tab:green",
+    "HD97658": "tab:red",
+}
+
+SCENARIO_MARKERS = {
+    1: "o",
+    2: "s",
+    3: "^",
+    "1": "o",
+    "2": "s",
+    "3": "^",
+}
+
+# Aerosol fields to exclude from haze proxy by default.
+# RFRAC is a fraction and not a loading; it should not be added to haze mass/loading proxies.
+EXCLUDE_AEROSOL_SPECIES = {"RFRAC"}
+
+
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def safe_ratio(a, b):
+    a = pd.to_numeric(a, errors="coerce")
+    b = pd.to_numeric(b, errors="coerce")
+    out = pd.Series(np.nan, index=a.index, dtype=float)
+    mask = np.isfinite(a) & np.isfinite(b) & (b > 0)
+    out.loc[mask] = a.loc[mask] / b.loc[mask]
+    return out
+
+
+def log10_change(v, ref):
+    if pd.isna(v) or pd.isna(ref) or v <= 0 or ref <= 0:
+        return np.nan
+    return np.log10(v / ref)
+
+
+def classify_haze(x):
+    if not np.isfinite(x):
+        return "unknown"
+    if x >= 1e12:
+        return "very_thick_haze"
+    if x >= 1e10:
+        return "thick_haze"
+    if x >= 1e8:
+        return "weak_haze"
+    return "clear"
+
+
+def classify_redox(x):
+    if not np.isfinite(x):
+        return "unknown"
+    if x >= 1:
+        return "strongly_reducing"
+    if x >= 0.1:
+        return "moderately_reducing"
+    return "weakly_reducing_or_oxidizing"
+
+
+def significance_from_log_change(x):
+    if not np.isfinite(x):
+        return "unknown"
+    ax = abs(x)
+    if ax >= 2.0:
+        return "extreme"
+    if ax >= 1.0:
+        return "major"
+    if ax >= 0.5:
+        return "moderate"
+    if ax >= 0.2:
+        return "minor"
+    return "small"
+
+
+def positive_finite(series):
+    s = pd.to_numeric(series, errors="coerce")
+    mask = np.isfinite(s) & (s > 0)
+    return s[mask]
+
+
+# --------------------------------------------------
+# LOAD + RESHAPE
+# --------------------------------------------------
+def load_species_wide(path):
+    df = pd.read_csv(path)
+
+    required = ["run", "star", "scenario", "fscale", "species", "column_proxy"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"species_metrics.csv missing columns: {missing}")
+
+    case_cols = ["run", "run_label", "star", "scenario", "fscale", "scale_dir"]
+
+    wide = (
+        df[case_cols + ["species", "column_proxy"]]
+        .pivot_table(
+            index=case_cols,
+            columns="species",
+            values="column_proxy",
+            aggfunc="first"
+        )
+        .reset_index()
+    )
+
+    rename_map = {}
+    for sp in ["H2O", "CH4", "CO", "CO2", "O2", "O3", "H2"]:
+        if sp in wide.columns:
+            rename_map[sp] = f"{sp}_column"
+    wide = wide.rename(columns=rename_map)
+
+    return wide
+
+
+def load_aerosol_case_sums(path):
+    df = pd.read_csv(path)
+
+    required = ["run", "star", "scenario", "fscale", "species", "column_proxy"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"aerosol_metrics.csv missing columns: {missing}")
+
+    case_cols = ["run", "run_label", "star", "scenario", "fscale", "scale_dir"]
+
+    use_df = df.copy()
+    if "species" in use_df.columns:
+        use_df["species"] = use_df["species"].astype(str)
+        use_df = use_df[~use_df["species"].isin(EXCLUDE_AEROSOL_SPECIES)].copy()
+
+    summed = (
+        use_df.groupby(case_cols, as_index=False)["column_proxy"]
+        .sum()
+        .rename(columns={"column_proxy": "haze_proxy"})
+    )
+
+    return summed
+
+
+# --------------------------------------------------
+# SYNTHESIS
+# --------------------------------------------------
+def build_synthesis(species_wide, aerosol_sum):
+    merge_cols = ["run", "run_label", "star", "scenario", "fscale", "scale_dir"]
+    df = pd.merge(species_wide, aerosol_sum, on=merge_cols, how="inner")
+
+    needed_species = ["CH4_column", "CO2_column", "H2_column", "O2_column"]
+    for col in needed_species:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df["CH4_CO2"] = safe_ratio(df["CH4_column"], df["CO2_column"])
+    df["redox_proxy"] = safe_ratio(
+        df["H2_column"].fillna(0) + df["CH4_column"].fillna(0),
+        df["CO2_column"].fillna(0) + df["O2_column"].fillna(0),
+    )
+
+    df["haze_regime"] = df["haze_proxy"].apply(classify_haze)
+    df["redox_regime"] = df["redox_proxy"].apply(classify_redox)
+
+    return df
+
+
+def build_comparisons(df):
+    rows = []
+
+    for star in sorted(df["star"].dropna().unique()):
+        for scenario in sorted(df["scenario"].dropna().unique(), key=lambda x: float(x)):
+            sub = df[(df["star"] == star) & (df["scenario"] == scenario)].copy()
+            if sub.empty:
+                continue
+
+            ref = sub[sub["run"] == "Run_1"]
+            if ref.empty:
+                continue
+            ref = ref.iloc[0]
+
+            for _, row in sub.iterrows():
+                rows.append({
+                    "comparison_type": "run_at_fixed_fscale",
+                    "star": star,
+                    "scenario": scenario,
+                    "fscale": row["fscale"],
+                    "case_id": f"{row['run']}|{star}|s{scenario}",
+                    "reference": f"Run_1|{star}|s{scenario}",
+                    "run": row["run"],
+                    "run_label": row["run_label"],
+                    "log10_CH4_CO2_change": log10_change(row["CH4_CO2"], ref["CH4_CO2"]),
+                    "log10_haze_change": log10_change(row["haze_proxy"], ref["haze_proxy"]),
+                    "log10_redox_change": log10_change(row["redox_proxy"], ref["redox_proxy"]),
+                })
+
+    for star in sorted(df["star"].dropna().unique()):
+        for run in sorted(df["run"].dropna().unique()):
+            sub = df[(df["star"] == star) & (df["run"] == run)].copy()
+            if sub.empty:
+                continue
+
+            ref = sub[sub["scenario"].astype(str) == "2"]
+            if ref.empty:
+                continue
+            ref = ref.iloc[0]
+
+            for _, row in sub.iterrows():
+                rows.append({
+                    "comparison_type": "fscale_at_fixed_run",
+                    "star": star,
+                    "scenario": row["scenario"],
+                    "fscale": row["fscale"],
+                    "case_id": f"{run}|{star}|s{row['scenario']}",
+                    "reference": f"{run}|{star}|s2",
+                    "run": row["run"],
+                    "run_label": row["run_label"],
+                    "log10_CH4_CO2_change": log10_change(row["CH4_CO2"], ref["CH4_CO2"]),
+                    "log10_haze_change": log10_change(row["haze_proxy"], ref["haze_proxy"]),
+                    "log10_redox_change": log10_change(row["redox_proxy"], ref["redox_proxy"]),
+                })
+
+    comp = pd.DataFrame(rows)
+    if comp.empty:
+        return comp
+
+    comp["CH4_CO2_significance"] = comp["log10_CH4_CO2_change"].apply(significance_from_log_change)
+    comp["haze_significance"] = comp["log10_haze_change"].apply(significance_from_log_change)
+    comp["redox_significance"] = comp["log10_redox_change"].apply(significance_from_log_change)
+
+    return comp
+
+
+# --------------------------------------------------
+# FIGURES
+# --------------------------------------------------
+def save_regime_diagram(df, out_dir):
+    fig, ax = plt.subplots(figsize=(7.5, 5.8))
+    plotted = False
+
+    for star in STAR_ORDER:
+        sub_star = df[df["star"] == star]
+        if sub_star.empty:
+            continue
+
+        for scenario in sorted(sub_star["scenario"].unique(), key=lambda x: float(x)):
+            sub = sub_star[sub_star["scenario"] == scenario].copy()
+            if sub.empty:
+                continue
+
+            x = pd.to_numeric(sub["CH4_CO2"], errors="coerce")
+            y = pd.to_numeric(sub["haze_proxy"], errors="coerce")
+            mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+            if not np.any(mask):
+                continue
+
+            ax.scatter(
+                x[mask],
+                y[mask],
+                label=f"{star}, FSCALE={SCENARIO_TO_FSCALE.get(scenario, scenario):.2f}",
+                color=STAR_COLORS.get(star, None),
+                marker=SCENARIO_MARKERS.get(scenario, "o"),
+                s=70,
+                alpha=0.9,
+                edgecolors="black",
+                linewidths=0.4,
+            )
+            plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        print("No positive finite data available for haze regime diagram.")
+        return
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"CH$_4$/CO$_2$ column proxy ratio")
+    ax.set_ylabel("Haze proxy (summed aerosol column proxy)")
+    ax.set_title("Archean-haze regime synthesis")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(fontsize=8, loc="best")
+
+    fig.savefig(os.path.join(out_dir, "haze_regime_diagram.png"), dpi=300, bbox_inches="tight")
+    fig.savefig(os.path.join(out_dir, "haze_regime_diagram.pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_star_comparison(df, out_dir):
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.8))
+    metrics = [
+        ("CH4_CO2", r"CH$_4$/CO$_2$"),
+        ("haze_proxy", "Haze proxy"),
+        ("redox_proxy", "Redox proxy"),
+    ]
+
+    for ax, (metric, label) in zip(axes, metrics):
+        x = np.arange(len(STAR_ORDER))
+        width = 0.22
+
+        plotted_any = False
+        for i, scenario in enumerate([1, 2, 3]):
+            vals = []
+            for star in STAR_ORDER:
+                sub = df[(df["star"] == star) & (df["scenario"] == scenario)]
+                vals.append(np.nanmedian(sub[metric]) if not sub.empty else np.nan)
+
+            vals_arr = np.asarray(vals, dtype=float)
+            ax.bar(
+                x + (i - 1) * width,
+                vals_arr,
+                width=width,
+                label=f"FSCALE={SCENARIO_TO_FSCALE[scenario]:.2f}",
+                alpha=0.9,
+            )
+            if np.any(np.isfinite(vals_arr)):
+                plotted_any = True
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(STAR_ORDER, rotation=20, ha="right")
+        ax.set_title(label)
+        ax.grid(True, axis="y", alpha=0.3)
+
+        vals_all = positive_finite(df[metric])
+        if len(vals_all) > 0 and plotted_any:
+            ax.set_yscale("log")
+
+    axes[0].legend(fontsize=8)
+    fig.suptitle("Median star-by-star synthesis across runs", y=1.02)
+    fig.savefig(os.path.join(out_dir, "star_comparison.png"), dpi=300, bbox_inches="tight")
+    fig.savefig(os.path.join(out_dir, "star_comparison.pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_fscale_sensitivity(df, out_dir):
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.8))
+    metrics = [
+        ("CH4_CO2", r"CH$_4$/CO$_2$"),
+        ("haze_proxy", "Haze proxy"),
+        ("redox_proxy", "Redox proxy"),
+    ]
+
+    for ax, (metric, label) in zip(axes, metrics):
+        plotted_any = False
+
+        for star in STAR_ORDER:
+            sub = df[df["star"] == star].copy()
+            if sub.empty:
+                continue
+
+            grouped = (
+                sub.groupby("fscale", as_index=False)[metric]
+                .median()
+                .sort_values("fscale")
+            )
+
+            x = pd.to_numeric(grouped["fscale"], errors="coerce")
+            y = pd.to_numeric(grouped[metric], errors="coerce")
+            mask = np.isfinite(x) & np.isfinite(y)
+
+            if not np.any(mask):
+                continue
+
+            ax.plot(x[mask], y[mask], marker="o", label=star)
+            plotted_any = True
+
+        ax.set_xlabel("FSCALE")
+        ax.set_title(label)
+        ax.grid(True, alpha=0.3)
+
+        vals_all = positive_finite(df[metric])
+        if len(vals_all) > 0 and plotted_any:
+            ax.set_yscale("log")
+
+    axes[0].set_ylabel("Median value")
+    axes[0].legend(fontsize=8)
+    fig.suptitle("FSCALE sensitivity across stars", y=1.02)
+    fig.savefig(os.path.join(out_dir, "fscale_sensitivity.png"), dpi=300, bbox_inches="tight")
+    fig.savefig(os.path.join(out_dir, "fscale_sensitivity.pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
+# --------------------------------------------------
+# SUMMARY TEXT
+# --------------------------------------------------
+def build_summary_text(df, comp):
+    lines = []
+    lines.append("Archean-haze synthesis summary")
+    lines.append("============================")
+    lines.append("")
+    lines.append("Notes:")
+    lines.append("- Haze proxy is built from summed aerosol column_proxy values.")
+    lines.append(f"- Excluded aerosol species from haze proxy: {sorted(EXCLUDE_AEROSOL_SPECIES)}")
+    lines.append("- This is a comparative haze-strength proxy, not a true optical depth.")
+    lines.append("")
+
+    for star in STAR_ORDER:
+        sub = df[df["star"] == star].copy()
+        if sub.empty:
+            continue
+
+        lines.append(star)
+        lines.append("-" * len(star))
+
+        sub = sub.sort_values(["run", "scenario"])
+        for _, row in sub.iterrows():
+            lines.append(
+                f"{row['run_label']}, FSCALE={row['fscale']:.2f}: "
+                f"CH4/CO2={row['CH4_CO2']:.3e}, "
+                f"redox={row['redox_proxy']:.3e} ({row['redox_regime']}), "
+                f"haze={row['haze_proxy']:.3e} ({row['haze_regime']})"
+            )
+
+        star_comp = comp[comp["star"] == star].copy() if not comp.empty else pd.DataFrame()
+        if not star_comp.empty:
+            haze_valid = star_comp["log10_haze_change"].abs().fillna(-np.inf)
+            if np.isfinite(haze_valid).any():
+                top_haze = star_comp.iloc[haze_valid.argmax()]
+                lines.append(
+                    f"Strongest haze shift: {top_haze['comparison_type']} for {top_haze['case_id']} "
+                    f"relative to {top_haze['reference']} "
+                    f"(Δlog10 haze = {top_haze['log10_haze_change']:.2f}, "
+                    f"{top_haze['haze_significance']})."
+                )
+
+            ch4_valid = star_comp["log10_CH4_CO2_change"].abs().fillna(-np.inf)
+            if np.isfinite(ch4_valid).any():
+                top_ch4co2 = star_comp.iloc[ch4_valid.argmax()]
+                lines.append(
+                    f"Strongest CH4/CO2 shift: {top_ch4co2['comparison_type']} for {top_ch4co2['case_id']} "
+                    f"relative to {top_ch4co2['reference']} "
+                    f"(Δlog10 CH4/CO2 = {top_ch4co2['log10_CH4_CO2_change']:.2f}, "
+                    f"{top_ch4co2['CH4_CO2_significance']})."
+                )
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
+def main():
+    ensure_dir(OUT_DIR)
+
+    if not os.path.exists(SPECIES_FILE):
+        raise FileNotFoundError(f"Missing file: {SPECIES_FILE}")
+    if not os.path.exists(AEROSOL_FILE):
+        raise FileNotFoundError(f"Missing file: {AEROSOL_FILE}")
+
+    species_wide = load_species_wide(SPECIES_FILE)
+    aerosol_sum = load_aerosol_case_sums(AEROSOL_FILE)
+
+    synth = build_synthesis(species_wide, aerosol_sum)
+    comp = build_comparisons(synth)
+
+    synth = synth.sort_values(["star", "run", "scenario"]).reset_index(drop=True)
+
+    synth_csv = os.path.join(OUT_DIR, "haze_synthesis.csv")
+    comp_csv = os.path.join(OUT_DIR, "haze_synthesis_comparisons.csv")
+    synth.to_csv(synth_csv, index=False)
+    comp.to_csv(comp_csv, index=False)
+
+    save_regime_diagram(synth, OUT_DIR)
+    save_star_comparison(synth, OUT_DIR)
+    save_fscale_sensitivity(synth, OUT_DIR)
+
+    summary_txt = os.path.join(OUT_DIR, "haze_summary.txt")
+    with open(summary_txt, "w") as f:
+        f.write(build_summary_text(synth, comp))
+
+    print("Done.")
+    print(f"Saved: {synth_csv}")
+    print(f"Saved: {comp_csv}")
+    print(f"Saved: {os.path.join(OUT_DIR, 'haze_regime_diagram.png')}")
+    print(f"Saved: {os.path.join(OUT_DIR, 'haze_regime_diagram.pdf')}")
+    print(f"Saved: {os.path.join(OUT_DIR, 'star_comparison.png')}")
+    print(f"Saved: {os.path.join(OUT_DIR, 'star_comparison.pdf')}")
+    print(f"Saved: {os.path.join(OUT_DIR, 'fscale_sensitivity.png')}")
+    print(f"Saved: {os.path.join(OUT_DIR, 'fscale_sensitivity.pdf')}")
+    print(f"Saved: {summary_txt}")
+
+
+if __name__ == "__main__":
+    main()
