@@ -32,7 +32,7 @@ However due to time constraints comments are limited.
 
 ## Plots
 
-All generated figures are stored in:
+a few plots generated figures are stored in:
 
 ```
 plots.zip
@@ -48,6 +48,8 @@ To view the plots, extract the archive:
 ```bash
 unzip plots.zip
 ```
+
+However due to space constraints on GitHub only a very small amount have been uploaded (contact Bernard.Atkinson@me.com for the entite suite of plots 192Mb)
 
 ---
 
