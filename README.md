@@ -11,9 +11,8 @@ This repository contains scripts and output plots associated with modelling atmo
 ```
 .
 ├── scripts/        # All code used for modelling and analysis
-├── plots.zip       # Compressed archive containing generated figures
 └── README.md       # Project documentation (this file)
-```
+└── *.sh            # Shell scripts (not used) for automating ATMoS```
 
 ---
 
@@ -26,7 +25,8 @@ The `scripts/` directory contains the code used throughout the project. This may
 * Model execution workflows (e.g., Atmos runs)
 * Plotting and analysis tools
 
-Each script should ideally be documented with comments explaining its purpose and usage.
+Each script should ideally be documented with comments explaining its purpose and usage
+However due to time constraints comments are limited.
 
 ---
 
